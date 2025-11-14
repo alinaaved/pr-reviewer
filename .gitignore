@@ -1,0 +1,4 @@
+.env
+*.env
+configs/.env
+!configs/.env.example  # пример оставляем в гите
