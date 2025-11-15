@@ -14,3 +14,19 @@ services:
       interval: 2s
       timeout: 2s
       retries: 30
+
+  app:
+    image: golang:1.25-alpine
+    working_dir: /app
+    command: sh -c "GOTOOLCHAIN=auto go mod download && go run ./cmd/server"
+    environment:
+      DB_DSN: postgres://app:app@db:5432/app?sslmode=disable
+      APP_PORT: :8080
+      GOTOOLCHAIN: auto
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ..:/app
+    ports:
+      - "8080:8080"

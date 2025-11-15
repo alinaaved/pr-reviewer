@@ -11,8 +11,10 @@ import (
 	"github.com/alinaaved/pr-reviewer/internal/model"
 )
 
+// Handler инкапсулирует зависимости HTTP-слоя (БД и т.п.)
 type Handler struct{ db *gorm.DB }
 
+// NewHandler создаёт новый Handler
 func NewHandler(db *gorm.DB) *Handler { return &Handler{db: db} }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -26,11 +28,12 @@ func writeErr(w http.ResponseWriter, code, msg string, status int) {
 	writeJSON(w, status, resp)
 }
 
-// Liveness
+// Healthz возвращает 200 OK для проверки живости сервиса
 func (h *Handler) Healthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// TeamAdd обрабатывает POST /team/add
 // POST /team/add -> 201 {team:{...}} | 400 TEAM_EXISTS
 func (h *Handler) TeamAdd(w http.ResponseWriter, r *http.Request) {
 	var in Team
@@ -55,7 +58,7 @@ func (h *Handler) TeamAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// создаём команду
+	// создаем команду
 	if err := h.db.Create(&model.TeamDB{TeamName: in.TeamName}).Error; err != nil {
 		writeErr(w, "INTERNAL", "db error", http.StatusInternalServerError)
 		return
@@ -81,6 +84,7 @@ func (h *Handler) TeamAdd(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"team": in})
 }
 
+// TeamGet обрабатывает GET /team/get
 // GET /team/get?team_name=... -> 200 (голый Team) | 404
 func (h *Handler) TeamGet(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("team_name")
@@ -117,6 +121,7 @@ func (h *Handler) TeamGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// UsersSetIsActive обрабатывает POST /users/setIsActive
 // POST /users/setIsActive -> 200 {user:{...}} | 404
 func (h *Handler) UsersSetIsActive(w http.ResponseWriter, r *http.Request) {
 	var in struct {
@@ -154,6 +159,7 @@ func (h *Handler) UsersSetIsActive(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// UsersGetReview обрабатывает GET /users/getReview
 // GET /users/getReview?user_id=... -> 200 { user_id, pull_requests:[...] }
 func (h *Handler) UsersGetReview(w http.ResponseWriter, r *http.Request) {
 	uid := r.URL.Query().Get("user_id")
@@ -219,6 +225,7 @@ func (h *Handler) buildPR(pr model.PullRequestDB) (PullRequest, error) {
 	return out, nil
 }
 
+// PRCreate обрабатывает POST /pullRequest/create
 // POST /pullRequest/create
 // 201 {pr:{...}} | 404 NOT_FOUND (нет автора/команды) | 409 PR_EXISTS
 func (h *Handler) PRCreate(w http.ResponseWriter, r *http.Request) {
@@ -304,6 +311,7 @@ func (h *Handler) PRCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"pr": out})
 }
 
+// PRMerge обрабатывает POST /pullRequest/merge (идемпотентно)
 // POST /pullRequest/merge — идемпотентно
 // 200 {pr:{...}} | 404 NOT_FOUND
 func (h *Handler) PRMerge(w http.ResponseWriter, r *http.Request) {
@@ -340,108 +348,149 @@ func (h *Handler) PRMerge(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"pr": out})
 }
 
+// PRReassign обрабатывает POST /pullRequest/reassign
 // POST /pullRequest/reassign
-// 200 {pr:{...}, replaced_by:"uX"} |
-// 404 NOT_FOUND | 409 PR_MERGED | 409 NOT_ASSIGNED | 409 NO_CANDIDATE
+// { pull_request_id, old_user_id } -> 200 { pr:{...}, replaced_by:"uX" }
+// 404 NOT_FOUND, 409 PR_MERGED | NOT_ASSIGNED | NO_CANDIDATE
 func (h *Handler) PRReassign(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		ID            string `json:"pull_request_id"`
-		OldUserID     string `json:"old_user_id"`
-		OldReviewerID string `json:"old_reviewer_id"` // пример в openapi использует это имя — поддержим оба
+		PRID    string `json:"pull_request_id"`
+		OldUser string `json:"old_user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		writeErr(w, "BAD_REQUEST", "invalid json", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.PRID == "" || in.OldUser == "" {
+		// не жесткий enum — отдаём просто 400 без code
+		writeJSON(w, http.StatusBadRequest, map[string]string{"message": "bad request"})
 		return
 	}
-	if in.OldUserID == "" && in.OldReviewerID != "" {
-		in.OldUserID = in.OldReviewerID
-	}
 
+	// В транзакции, чтобы "увидеть" апдейт при последующем чтении.
 	err := h.db.Transaction(func(tx *gorm.DB) error {
-		// PR существует и не MERGED?
+		// 1) PR существует и открыт
 		var pr model.PullRequestDB
-		if err := tx.First(&pr, "pull_request_id = ?", in.ID).Error; err != nil {
+		if err := tx.First(&pr, "pull_request_id = ?", in.PRID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				writeErr(w, "NOT_FOUND", "PR not found", http.StatusNotFound)
-				return err
+				return errStop // см. ниже локальная ошибка для раннего выхода
 			}
-			writeErr(w, "INTERNAL", "db error", http.StatusInternalServerError)
-			return err
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "db error"})
+			return errStop
 		}
 		if pr.Status == "MERGED" {
 			writeErr(w, "PR_MERGED", "cannot reassign on merged PR", http.StatusConflict)
-			return errors.New("merged")
+			return errStop
 		}
 
-		// old_user назначен?
+		// 2) Проверить, что old_user назначен и достать его слот (position)
 		var slot model.PRReviewerDB
-		if err := tx.First(&slot, "pr_id = ? AND reviewer_id = ?", in.ID, in.OldUserID).Error; err != nil {
+		if err := tx.First(&slot, "pr_id = ? AND reviewer_id = ?", in.PRID, in.OldUser).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				writeErr(w, "NOT_ASSIGNED", "reviewer is not assigned to this PR", http.StatusConflict)
-				return err
+				return errStop
 			}
-			writeErr(w, "INTERNAL", "db error", http.StatusInternalServerError)
-			return err
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "db error"})
+			return errStop
 		}
 
-		// команда заменяемого
-		var oldU model.UserDB
-		if err := tx.First(&oldU, "user_id = ?", in.OldUserID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				writeErr(w, "NOT_FOUND", "user not found", http.StatusNotFound)
-				return err
-			}
-			writeErr(w, "INTERNAL", "db error", http.StatusInternalServerError)
-			return err
+		// 3) Узнать команду заменяемого ревьювера
+		var oldUser model.UserDB
+		if err := tx.First(&oldUser, "user_id = ?", in.OldUser).Error; err != nil {
+			writeErr(w, "NOT_FOUND", "user not found", http.StatusNotFound)
+			return errStop
 		}
 
-		// второй текущий ревьювер (чтобы не назначить его же)
-		var otherIDs []string
-		if err := tx.
-			Table("pr_reviewers").
+		// 4) Найти второго текущего ревьювера (если есть)
+		var other []string
+		if err := tx.Table("pr_reviewers").
 			Select("reviewer_id").
-			Where("pr_id = ? AND reviewer_id <> ?", in.ID, in.OldUserID).
-			Scan(&otherIDs).Error; err != nil {
-			writeErr(w, "INTERNAL", "db error", http.StatusInternalServerError)
-			return err
+			Where("pr_id = ? AND position <> ?", in.PRID, slot.Position).
+			Scan(&other).Error; err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "db error"})
+			return errStop
 		}
 
-		// подобрать кандидата: активный, из команды oldU, не автор, не old, не другой текущий
-		query := tx.Table("users").Select("user_id AS id").
-			Where("team_name = ? AND is_active = TRUE", oldU.TeamName).
-			Where("user_id <> ?", in.OldUserID).
-			Where("user_id <> ?", pr.AuthorID)
-		if len(otherIDs) > 0 {
-			query = query.Where("user_id <> ?", otherIDs[0])
+		// 5) Кандидат: активный из команды oldUser, не автор, не второй текущий, не oldUser
+		q := tx.Table("users").Select("user_id").
+			Where("team_name = ? AND is_active = TRUE", oldUser.TeamName).
+			Where("user_id <> ? AND user_id <> ?", in.OldUser, pr.AuthorID)
+		if len(other) > 0 {
+			q = q.Where("user_id <> ?", other[0])
 		}
-		var repl struct{ ID string }
-		if err := query.Order("random()").Limit(1).Scan(&repl).Error; err != nil {
-			writeErr(w, "INTERNAL", "db error", http.StatusInternalServerError)
-			return err
+		var newID string
+		if err := q.Order("random()").Limit(1).Scan(&newID).Error; err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "db error"})
+			return errStop
 		}
-		if repl.ID == "" {
+		if newID == "" {
 			writeErr(w, "NO_CANDIDATE", "no active replacement candidate in team", http.StatusConflict)
-			return errors.New("no_candidate")
+			return errStop
 		}
 
-		// заменить в той же позиции
+		// 6) Апдейтим конкретный слот по position (важно!)
 		if err := tx.Model(&model.PRReviewerDB{}).
-			Where("pr_id = ? AND position = ?", in.ID, slot.Position).
-			Update("reviewer_id", repl.ID).Error; err != nil {
-			writeErr(w, "INTERNAL", "db error", http.StatusInternalServerError)
-			return err
+			Where("pr_id = ? AND position = ?", in.PRID, slot.Position).
+			Update("reviewer_id", newID).Error; err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "db error"})
+			return errStop
 		}
 
-		// ответ
-		out, err := h.buildPR(pr)
-		if err != nil {
-			writeErr(w, "INTERNAL", "db error", http.StatusInternalServerError)
-			return err
+		// 7) Читаем обновлённый состав (после апдейта)
+		type row struct{ ReviewerID string }
+		var rows []row
+		if err := tx.Table("pr_reviewers").
+			Select("reviewer_id").
+			Where("pr_id = ?", in.PRID).
+			Order("position").
+			Scan(&rows).Error; err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"message": "db error"})
+			return errStop
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"pr": out, "replaced_by": repl.ID})
+		assigned := make([]string, 0, len(rows))
+		for _, r := range rows {
+			assigned = append(assigned, r.ReviewerID)
+		}
+
+		// 8) Готовим ответ по контракту
+		writeJSON(w, http.StatusOK, map[string]any{
+			"pr": map[string]any{
+				"pull_request_id":    pr.ID,
+				"pull_request_name":  pr.Name,
+				"author_id":          pr.AuthorID,
+				"status":             pr.Status,
+				"assigned_reviewers": assigned,
+				"createdAt":          pr.CreatedAt,
+				"mergedAt":           pr.MergedAt,
+			},
+			"replaced_by": newID,
+		})
 		return nil
 	})
-	if err != nil {
+
+	if err == nil {
 		return
 	}
+	// errStop — локальная заглушка, чтобы «выйти» после writeJSON/writeErr
+	// сами ответы уже отправлены, тут просто завершаем
+}
+
+var errStop = errors.New("stop")
+
+// StatsAssignmentsByUser возвращает агрегацию назначений по пользователям
+// GET /stats/assignments-by-user
+// 200 { "items": [ {"user_id":"u2","count":3}, ... ] }
+func (h *Handler) StatsAssignmentsByUser(w http.ResponseWriter, _ *http.Request) {
+	type row struct {
+		UserID string `json:"user_id"`
+		Count  int64  `json:"count"`
+	}
+	var rows []row
+	if err := h.db.
+		Table("pr_reviewers").
+		Select("reviewer_id AS user_id, COUNT(*) AS count").
+		Group("reviewer_id").
+		Order("count DESC").
+		Scan(&rows).Error; err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": rows})
 }

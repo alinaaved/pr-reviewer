@@ -1,0 +1,8 @@
+.git
+.vscode
+.idea
+dist
+bin
+**/*.md
+deploy
+db/migrations/*.down.sql
