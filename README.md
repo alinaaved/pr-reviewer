@@ -3,9 +3,13 @@
 Сервис для автоматического назначения ревьюверов на Pull Request, управления командами и активностью пользователей
 
 - Язык: Go  
+
 - Web: chi  
+
 - ORM: GORM  
+
 - БД: PostgreSQL  
+
 - Запуск: `docker compose up` (поднимает БД + приложение на `:8080`)
 
 ## Как запустить
@@ -29,8 +33,11 @@ make down
 ## Переменные окружения
 
 `APP_PORT` — порт HTTP-сервера (по умолчанию :8080)
+
 `DB_DSN` — строка подключения к PostgreSQL
+
 локально: `postgres://app:app@localhost:5432/app?sslmode=disable`
+
 в docker-compose: `postgres://app:app@db:5432/app?sslmode=disable`
 
 Шаблон: configs/.env.example.
@@ -39,10 +46,15 @@ make down
 ## Makefile
 
 make up    # поднять БД и приложение (compose up -d --build)
+
 make down  # остановить и удалить контейнеры и том БД
+
 make run   # локальный запуск (читает DB_DSN из .env.example)
+
 make logs  # логи приложения (docker compose logs -f app)
+
 make test  # go test ./... -v
+
 make lint  # golangci-lint run
 
 ## Архитектура данных
@@ -162,12 +174,12 @@ make lint
 .
 ├── cmd/server/main.go
 ├── internal/
-│   ├── http/            # httpapi: DTO + handlers
-│   └── model/           # GORM-модели (маппинг на таблицы)
+│   ├── http/ # httpapi: DTO + handlers
+│   └── model/ # GORM-модели
 ├── db/migrations/001_init.sql
 ├── deploy/docker-compose.yml
 ├── openapi.yml
 ├── Makefile
 ├── configs/.env.example
-└── k6/script.js         # сценарий нагрузки
+└── k6/script.js # сценарий нагрузки
 ```
